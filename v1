@@ -1,0 +1,358 @@
+# nfs_view_predictor.py
+# Lifetime predictor — now training on log(views+1) and converting back for outputs
+import streamlit as st
+import pandas as pd
+import numpy as np
+import re
+from bisect import bisect_right
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import r2_score, mean_absolute_error
+from scipy.sparse import hstack, csr_matrix
+
+st.set_page_config(page_title="NFS View Predictor — Log target", layout="centered")
+st.title("🔮 NFS View Predictor — (log-target, percentile scoring)")
+st.markdown("""
+This version trains models on `log(views + 1)` for stability, then converts predictions back to raw views.
+Component scores (Title/Description/Keywords) are channel-relative percentiles based on raw-space predictions.
+""")
+
+uploaded = st.file_uploader("Upload vidIQ CSV export (CSV)", type=["csv"])
+
+# ---------- helpers ----------
+def find_column(cols, patterns):
+    lower_map = {c: c.lower() for c in cols}
+    for pat in patterns:
+        for orig, low in lower_map.items():
+            if pat in low:
+                return orig
+    return None
+
+def detect_columns(df):
+    cols = list(df.columns)
+    title_col = find_column(cols, ["title", "video title"])
+    desc_col = find_column(cols, ["description", "desc", "video description"])
+    kw_col = find_column(cols, ["tags", "keywords", "key words", "tag list"])
+    views_col = find_column(cols, ["views", "view count", "video views", "lifetime views"])
+    vidiq_col = find_column(cols, ["vidiq", "vid iq", "vidiq score", "vidiq_score"])
+    duration_col = find_column(cols, ["duration", "length", "runtime"])
+    # fallback regex
+    if not title_col:
+        for c in cols:
+            if re.search(r"title", c, re.I):
+                title_col = c; break
+    if not desc_col:
+        for c in cols:
+            if re.search(r"desc", c, re.I):
+                desc_col = c; break
+    if not kw_col:
+        for c in cols:
+            if re.search(r"tag|keyw", c, re.I):
+                kw_col = c; break
+    if not views_col:
+        for c in cols:
+            if re.search(r"view", c, re.I):
+                views_col = c; break
+    return {
+        "title": title_col,
+        "description": desc_col,
+        "keywords": kw_col,
+        "views": views_col,
+        "vidiq": vidiq_col,
+        "duration": duration_col
+    }
+
+def parse_duration_to_seconds(s):
+    try:
+        if pd.isna(s) or s == "":
+            return 0.0
+        s = str(s).strip()
+        if ":" in s:
+            parts = [float(p) for p in s.split(":")]
+            if len(parts) == 3:
+                return parts[0]*3600 + parts[1]*60 + parts[2]
+            elif len(parts) == 2:
+                return parts[0]*60 + parts[1]
+        # fallback digits
+        return float(re.sub(r"[^\d\.]", "", s))
+    except:
+        return 0.0
+
+def percentile_interp(sorted_arr, x):
+    """Return percentile (0..1) of x in sorted_arr using interpolation."""
+    n = len(sorted_arr)
+    if n == 0:
+        return 0.0
+    idx = np.searchsorted(sorted_arr, x, side='right')
+    if idx == 0:
+        return 0.0
+    if idx >= n:
+        return 1.0
+    left = sorted_arr[idx-1]
+    right = sorted_arr[idx]
+    if right == left:
+        return idx / n
+    frac = (x - left) / (right - left)
+    return (idx - 1 + frac) / n
+
+def percentile_to_label(p):
+    # p is 0..1
+    score = int(round(p * 100))
+    if score >= 90:
+        return f"{score} — Excellent (Top {100-score}%)"
+    if score >= 80:
+        return f"{score} — Very Good (Top {100-score}%)"
+    if score >= 70:
+        return f"{score} — Good (Top {100-score}%)"
+    if score >= 50:
+        return f"{score} — Average (Top {100-score}%)"
+    if score >= 30:
+        return f"{score} — Weak (Bottom {score}%)"
+    return f"{score} — Poor (Bottom {score}%)"
+
+# ---------- main ----------
+if uploaded:
+    try:
+        df = pd.read_csv(uploaded)
+    except Exception as e:
+        st.error(f"Could not read CSV: {e}")
+        st.stop()
+
+    st.write("Columns detected:", list(df.columns))
+
+    cols_map = detect_columns(df)
+    st.write("Auto-detected mapping:", cols_map)
+
+    if not cols_map["views"]:
+        st.error("No Views column found. Training needs a numeric Views column. Upload a vidIQ export with Views.")
+        st.stop()
+
+    # Prepare textual columns
+    if cols_map["title"]:
+        df["title"] = df[cols_map["title"]].astype(str)
+    else:
+        st.error("Title column not found.")
+        st.stop()
+
+    df["description"] = df[cols_map["description"]].astype(str) if cols_map["description"] else ""
+    df["keywords"] = df[cols_map["keywords"]].astype(str) if cols_map["keywords"] else ""
+
+    # numeric features
+    numeric_feats = []
+    if cols_map["vidiq"] and cols_map["vidiq"] in df.columns:
+        df["vidiq_score_num"] = pd.to_numeric(df[cols_map["vidiq"]].astype(str).str.extract(r"([\d\.]+)")[0], errors="coerce").fillna(0)
+        numeric_feats.append("vidiq_score_num")
+    if cols_map["duration"] and cols_map["duration"] in df.columns:
+        df["duration_num"] = df[cols_map["duration"]].apply(parse_duration_to_seconds)
+        numeric_feats.append("duration_num")
+
+    # parse views (strip commas/other non-digits)
+    df["views"] = pd.to_numeric(df[cols_map["views"]].astype(str).str.replace(r"[^\d]", "", regex=True), errors="coerce")
+    if df["views"].isna().all():
+        st.error("Detected Views column has no numeric values.")
+        st.stop()
+
+    # sanity
+    n_rows = len(df)
+    st.write(f"Rows: {n_rows}")
+    if n_rows < 10:
+        st.warning("Dataset < 10 rows. Percentiles will be noisy.")
+    if df["views"].dropna().shape[0] < 5:
+        st.error("Not enough numeric views values to train. Need at least 5.")
+        st.stop()
+
+    # train/test
+    X = df[["title", "description", "keywords"]].copy()
+    for nf in numeric_feats:
+        X[nf] = df[nf].fillna(0)
+    y = df["views"].astype(float)
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    # LOG transform target
+    y_train_log = np.log1p(y_train)
+    y_test_log = np.log1p(y_test)
+
+    # build vectorizers
+    title_vec = TfidfVectorizer(stop_words="english", min_df=1)
+    desc_vec = TfidfVectorizer(stop_words="english", min_df=1)
+    kw_vec   = TfidfVectorizer(stop_words="english", min_df=1)
+
+    # train component models ON LOG-SPACE
+    pipe_title = Pipeline([("vec", title_vec), ("model", GradientBoostingRegressor(random_state=42))])
+    pipe_desc  = Pipeline([("vec", desc_vec),  ("model", GradientBoostingRegressor(random_state=42))])
+    pipe_kw    = Pipeline([("vec", kw_vec),    ("model", GradientBoostingRegressor(random_state=42))])
+
+    st.info("Training title/description/keyword models (this may take a minute)...")
+    pipe_title.fit(X_train["title"], y_train_log)
+    pipe_desc.fit(X_train["description"], y_train_log)
+    pipe_kw.fit(X_train["keywords"], y_train_log)
+
+    # compute training predictions for ECDFs (convert back to raw)
+    train_title_preds_log = pipe_title.predict(X_train["title"])
+    train_desc_preds_log  = pipe_desc.predict(X_train["description"])
+    train_kw_preds_log    = pipe_kw.predict(X_train["keywords"])
+
+    train_title_preds_raw = np.expm1(train_title_preds_log)
+    train_desc_preds_raw  = np.expm1(train_desc_preds_log)
+    train_kw_preds_raw    = np.expm1(train_kw_preds_log)
+
+    title_arr = np.sort(train_title_preds_raw.astype(float))
+    desc_arr  = np.sort(train_desc_preds_raw.astype(float))
+    kw_arr    = np.sort(train_kw_preds_raw.astype(float))
+
+    # combined model manual (TF-IDF stacks) — train on log target
+    t_mat = title_vec.transform(X_train["title"])
+    d_mat = desc_vec.transform(X_train["description"])
+    k_mat = kw_vec.transform(X_train["keywords"])
+    if numeric_feats:
+        num_mat = csr_matrix(X_train[numeric_feats].fillna(0).values)
+        X_train_full = hstack([t_mat, d_mat, k_mat, num_mat])
+    else:
+        X_train_full = hstack([t_mat, d_mat, k_mat])
+
+    model_full = GradientBoostingRegressor(random_state=42)
+    model_full.fit(X_train_full.toarray(), y_train_log)
+
+    # validation metrics (MAE & R2) — we evaluate in RAW space for interpretability
+    try:
+        # predict on test in log space then convert to raw
+        t_mat_t = title_vec.transform(X_test["title"])
+        d_mat_t = desc_vec.transform(X_test["description"])
+        k_mat_t = kw_vec.transform(X_test["keywords"])
+        if numeric_feats:
+            num_mat_t = csr_matrix(X_test[numeric_feats].fillna(0).values)
+            X_test_full = hstack([t_mat_t, d_mat_t, k_mat_t, num_mat_t])
+        else:
+            X_test_full = hstack([t_mat_t, d_mat_t, k_mat_t])
+
+        pred_full_log_test = model_full.predict(X_test_full.toarray())
+        pred_full_raw_test = np.expm1(pred_full_log_test)
+        mae_full = mean_absolute_error(y_test, pred_full_raw_test)
+        r_full = r2_score(y_test, pred_full_raw_test)
+    except Exception:
+        mae_full = float("nan")
+        r_full = float("nan")
+
+    # also compute component MAEs (raw)
+    try:
+        pred_title_log_test = pipe_title.predict(X_test["title"])
+        pred_title_raw_test = np.expm1(pred_title_log_test)
+        maet = mean_absolute_error(y_test, pred_title_raw_test)
+    except:
+        maet = float("nan")
+    try:
+        pred_desc_log_test = pipe_desc.predict(X_test["description"])
+        pred_desc_raw_test = np.expm1(pred_desc_log_test)
+        maed = mean_absolute_error(y_test, pred_desc_raw_test)
+    except:
+        maed = float("nan")
+    try:
+        pred_kw_log_test = pipe_kw.predict(X_test["keywords"])
+        pred_kw_raw_test = np.expm1(pred_kw_log_test)
+        maek = mean_absolute_error(y_test, pred_kw_raw_test)
+    except:
+        maek = float("nan")
+
+    st.success("Training complete.")
+    st.write(f"Combined model R² (raw-space): {r_full if not np.isnan(r_full) else 'N/A'}")
+    st.write(f"Combined MAE (raw-space): {int(round(mae_full)) if not np.isnan(mae_full) else 'N/A'}")
+    st.write(f"Title MAE: {int(round(maet)) if not np.isnan(maet) else 'N/A'}; Desc MAE: {int(round(maed)) if not np.isnan(maed) else 'N/A'}; Kw MAE: {int(round(maek)) if not np.isnan(maek) else 'N/A'}")
+
+    st.markdown("---")
+    st.header("🔮 Score & Predict (log-target)")
+
+    new_title = st.text_input("Title")
+    new_desc = st.text_area("Description", height=120)
+    new_kw = st.text_input("Keywords (comma-separated)")
+    new_vidiq = st.number_input("VidIQ score (optional)", min_value=0.0, value=0.0, step=0.1) if cols_map["vidiq"] else 0.0
+    new_duration = st.text_input("Duration (optional mm:ss or seconds)") if cols_map["duration"] else ""
+
+    if st.button("Get Scores & Predict"):
+        if not new_title.strip():
+            st.error("Please enter a title.")
+            st.stop()
+
+        # predict components (log-space) and convert to raw
+        try:
+            p_title_log = pipe_title.predict([new_title])[0]
+            p_desc_log  = pipe_desc.predict([new_desc])[0]
+            p_kw_log    = pipe_kw.predict([new_kw])[0]
+            p_title_raw = np.expm1(p_title_log)
+            p_desc_raw  = np.expm1(p_desc_log)
+            p_kw_raw    = np.expm1(p_kw_log)
+        except Exception as e:
+            st.error(f"Component prediction failed: {e}")
+            st.stop()
+
+        # percentile -> scores (use raw predicted values for percentiles)
+        p_t = percentile_interp(title_arr, p_title_raw)
+        p_d = percentile_interp(desc_arr, p_desc_raw)
+        p_k = percentile_interp(kw_arr, p_kw_raw)
+
+        # Combined prediction (log-space -> raw)
+        t_t = title_vec.transform([new_title])
+        d_t = desc_vec.transform([new_desc])
+        k_t = kw_vec.transform([new_kw])
+        num_vals = []
+        for nf in numeric_feats:
+            if nf == "vidiq_score_num":
+                num_vals.append(float(new_vidiq))
+            elif nf == "duration_num":
+                try:
+                    if ":" in new_duration:
+                        parts = [float(p) for p in new_duration.split(":")]
+                        if len(parts) == 2:
+                            dur = parts[0]*60 + parts[1]
+                        else:
+                            dur = float(parts[0])
+                    else:
+                        dur = float(re.sub(r"[^\d\.]", "", new_duration)) if new_duration else 0.0
+                except:
+                    dur = 0.0
+                num_vals.append(dur)
+            else:
+                num_vals.append(0.0)
+
+        if num_vals:
+            num_mat_in = csr_matrix([num_vals])
+            X_in = hstack([t_t, d_t, k_t, num_mat_in])
+        else:
+            X_in = hstack([t_t, d_t, k_t])
+
+        try:
+            p_full_log = model_full.predict(X_in.toarray())[0]
+            p_full_raw = np.expm1(p_full_log)
+        except Exception as e:
+            st.error(f"Combined prediction failed: {e}")
+            p_full_raw = None
+
+        # Show scores and combined views
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Title Score", percentile_to_label(p_t))
+        col2.metric("Description Score", percentile_to_label(p_d))
+        col3.metric("Keywords Score", percentile_to_label(p_k))
+
+        st.markdown("---")
+        if p_full_raw is not None:
+            # confidence band: use mae_full (validation MAE)
+            if not np.isnan(mae_full):
+                low = max(0, p_full_raw - mae_full)
+                high = p_full_raw + mae_full
+                st.subheader(f"Predicted views: {int(round(p_full_raw)):,} ± {int(round(mae_full)):,} (MAE)")
+                st.write(f"Confidence interval (approx): {int(round(low)):,} — {int(round(high)):,}")
+            else:
+                st.subheader(f"Predicted views: {int(round(p_full_raw)):,}")
+        else:
+            st.subheader("Predicted views: N/A (model error)")
+
+        st.markdown("""
+        **How to use these scores**
+        - Title/Description/Keywords are shown as **channel-relative percentiles** (Top X%).  
+        - Use Title Score to pick between titles (higher is better).  
+        - Combined predicted views are the app's primary lifetime view estimate — MAE gives uncertainty.
+        """)
+else:
+    st.info("Upload your vidIQ CSV export to begin training the models and building percentile scores.")
